@@ -33,6 +33,14 @@ async fn main() {
     // Run the test.
     integration_test_manager.send_invoke_txs_and_verify(N_TXS, BLOCK_TO_WAIT_FOR).await;
 
+    // Run the L1 handler test.
+    integration_test_manager
+        .send_l1_handler_txs_and_verify(
+            1,
+            BLOCK_TO_WAIT_FOR.unchecked_next().unchecked_next().unchecked_next(),
+        )
+        .await;
+
     info!("Shutting down nodes.");
     integration_test_manager.shutdown_nodes(node_indices);
 

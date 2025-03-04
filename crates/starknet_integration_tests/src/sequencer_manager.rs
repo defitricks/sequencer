@@ -2,15 +2,22 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use alloy::node_bindings::AnvilInstance;
 use blockifier::context::ChainInfo;
 use futures::future::join_all;
 use futures::TryFutureExt;
 use mempool_test_utils::starknet_api_test_utils::{AccountId, MultiAccountTransactionGenerator};
+use papyrus_base_layer::ethereum_base_layer_contract::{EthereumBaseLayerContract, Starknet};
+use papyrus_base_layer::test_utils::{
+    anvil_instance_from_config,
+    create_ethereum_base_layer_config,
+};
 use papyrus_network::network_manager::test_utils::create_connected_network_configs;
 use papyrus_storage::StorageConfig;
 use starknet_api::block::BlockNumber;
 use starknet_api::core::Nonce;
 use starknet_api::rpc_transaction::RpcTransaction;
+use starknet_api::test_utils::CHAIN_ID_FOR_TESTS;
 use starknet_api::transaction::TransactionHash;
 use starknet_infra_utils::test_utils::{
     AvailablePorts,
@@ -38,8 +45,11 @@ use crate::utils::{
     create_mempool_p2p_configs,
     create_state_sync_configs,
     send_account_txs,
+    send_message_to_l2_and_calculate_tx_hash,
     BootstrapTxs,
     InvokeTxs,
+    L1HandlerTxs,
+    StarknetL1Contract,
     TestScenario,
 };
 const DEFAULT_SENDER_ACCOUNT: AccountId = 0;
@@ -163,6 +173,10 @@ pub struct IntegrationTestManager {
     idle_nodes: HashMap<usize, NodeSetup>,
     running_nodes: HashMap<usize, RunningNode>,
     tx_generator: MultiAccountTransactionGenerator,
+    // Handle for L1 server: the server is dropped when handle is dropped.
+    #[allow(dead_code)]
+    l1_handle: AnvilInstance,
+    starknet_l1_contract: StarknetL1Contract,
 }
 
 pub struct CustomPaths {
@@ -210,10 +224,27 @@ impl IntegrationTestManager {
         )
         .await;
 
+        let base_layer_config = &sequencers_setup[0].executables[0].config.base_layer_config;
+        tracing::info!("Trying to spawn anvil.");
+        let anvil = anvil_instance_from_config(base_layer_config);
+        let ethereum_base_layer_contract =
+            EthereumBaseLayerContract::new(base_layer_config.clone());
+        let starknet_l1_contract =
+            Starknet::deploy(ethereum_base_layer_contract.contract.provider().clone())
+                .await
+                .unwrap();
+
         let idle_nodes = create_map(sequencers_setup, |node| node.get_node_index());
         let running_nodes = HashMap::new();
 
-        Self { node_indices, idle_nodes, running_nodes, tx_generator }
+        Self {
+            node_indices,
+            idle_nodes,
+            running_nodes,
+            tx_generator,
+            l1_handle: anvil,
+            starknet_l1_contract,
+        }
     }
 
     pub fn get_idle_nodes(&self) -> &HashMap<usize, NodeSetup> {
@@ -356,6 +387,14 @@ impl IntegrationTestManager {
         self.test_and_verify(InvokeTxs(n_txs), DEFAULT_SENDER_ACCOUNT, wait_for_block).await;
     }
 
+    pub async fn send_l1_handler_txs_and_verify(
+        &mut self,
+        n_txs: usize,
+        wait_for_block: BlockNumber,
+    ) {
+        self.test_and_verify(L1HandlerTxs(n_txs), DEFAULT_SENDER_ACCOUNT, wait_for_block).await;
+    }
+
     pub async fn await_txs_accepted_on_all_running_nodes(&mut self, target_n_txs: usize) {
         let futures = self.running_nodes.iter().map(|(sequencer_idx, running_node)| {
             let monitoring_client = running_node.node_setup.batcher_monitoring_client();
@@ -411,13 +450,26 @@ impl IntegrationTestManager {
         sender_account: AccountId,
     ) {
         info!("Running integration test simulator.");
+        let send_l1_handler_tx_fn = &mut |l1_handler_tx| {
+            send_message_to_l2_and_calculate_tx_hash(
+                l1_handler_tx,
+                &self.starknet_l1_contract,
+                &CHAIN_ID_FOR_TESTS,
+            )
+        };
         let send_rpc_tx_fn = &mut |rpc_tx| async {
             let node_0 = self.running_nodes.get(&0).expect("Node 0 should be running.");
             node_0.node_setup.send_rpc_tx_fn(rpc_tx).await
         };
 
-        send_account_txs(&mut self.tx_generator, sender_account, test_scenario, send_rpc_tx_fn)
-            .await;
+        send_account_txs(
+            &mut self.tx_generator,
+            sender_account,
+            test_scenario,
+            send_rpc_tx_fn,
+            send_l1_handler_tx_fn,
+        )
+        .await;
     }
 
     async fn await_block(&self, expected_block_number: BlockNumber) {
@@ -504,6 +556,9 @@ pub async fn get_sequencer_setup_configs(
         available_ports.get_next_ports(n_distributed_sequencers),
     );
 
+    let base_layer_config =
+        create_ethereum_base_layer_config(Some(available_ports.get_next_port()));
+
     // TODO(Nadin/Tsabary): There are redundant p2p configs here, as each distributed node
     // needs only one of them, but the current setup creates one per part. Need to refactor.
 
@@ -541,6 +596,7 @@ pub async fn get_sequencer_setup_configs(
                     state_sync_config,
                     AvailablePorts::new(test_unique_id.into(), global_index.try_into().unwrap()),
                     executable_component_config.clone(),
+                    base_layer_config.clone(),
                     exec_db_path,
                     exec_config_path,
                     exec_data_prefix_dir,
